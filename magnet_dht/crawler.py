@@ -1,8 +1,11 @@
 #! usr/bin/python
 # encoding=utf-8
 
-import socket
 import codecs
+import hashlib
+import hmac
+import os
+import socket
 import time
 from threading import Thread
 from collections import deque
@@ -13,28 +16,9 @@ import bencoder
 from .utils import get_logger, get_nodes_info, get_rand_id, get_neighbor
 from .database import RedisClient
 
-# 服务器 tracker
+# DHT bootstrap routers.  Tracker announce URLs are not DHT bootstrap nodes and
+# cannot be passed to a UDP socket as an address.
 BOOTSTRAP_NODES = [
-    "udp://tracker.open-internet.nl:6969/announce",
-    "udp://tracker.coppersurfer.tk:6969/announce",
-    "udp://exodus.desync.com:6969/announce",
-    "udp://tracker.opentrackr.org:1337/announce",
-    "udp://tracker.internetwarriors.net:1337/announce",
-    "udp://9.rarbg.to:2710/announce",
-    "udp://public.popcorn-tracker.org:6969/announce",
-    "udp://tracker.vanitycore.co:6969/announce",
-    "https://1.track.ga:443/announce",
-    "udp://tracker.tiny-vps.com:6969/announce",
-    "udp://tracker.cypherpunks.ru:6969/announce",
-    "udp://thetracker.org:80/announce",
-    "udp://tracker.torrent.eu.org:451/announce",
-    "udp://retracker.lanta-net.ru:2710/announce",
-    "udp://bt.xxx-tracker.com:2710/announce",
-    "http://retracker.telecom.by:80/announce",
-    "http://retracker.mgts.by:80/announce",
-    "http://0d.kebhana.mx:443/announce",
-    "udp://torr.ws:2710/announce",
-    "udp://open.stealth.si:80/announce",
     ("router.bittorrent.com", 6881),
     ("dht.transmissionbt.com", 6881),
     ("router.utorrent.com", 6881),
@@ -58,6 +42,10 @@ PER_NID_LEN = 20
 PER_SEC_BS_TIMER = 8
 # 是否使用全部进程
 MAX_PROCESSES = cpu_count() // 2 or cpu_count()
+# Optional Linux interface pinning, useful when the default wired route blocks
+# UDP DHT but Wi-Fi works.
+NETWORK_INTERFACE = os.getenv("MAGNET_DHT_INTERFACE")
+TOKEN_ROTATE_SECONDS = 300
 
 
 class HNode:
@@ -73,10 +61,26 @@ class DHTServer:
         self.bind_port = bind_port
         self.process_id = process_id
         self.nid = get_rand_id()
+        self.token_secret = os.urandom(20)
+        self.previous_token_secret = None
+        self.token_secret_changed = time.monotonic()
         # nodes 节点是一个双端队列
         self.nodes = deque(maxlen=MAX_NODE_QSIZE)
         # KRPC 协议是由 bencode 编码组成的一个简单的 RPC 结构，使用 UDP 报文发送。
         self.udp = socket.socket(socket.AF_INET, socket.SOCK_DGRAM, socket.IPPROTO_UDP)
+        if NETWORK_INTERFACE:
+            if not hasattr(socket, "SO_BINDTODEVICE"):
+                raise RuntimeError("MAGNET_DHT_INTERFACE 仅支持 Linux")
+            try:
+                self.udp.setsockopt(
+                    socket.SOL_SOCKET,
+                    socket.SO_BINDTODEVICE,
+                    NETWORK_INTERFACE.encode() + b"\0",
+                )
+            except OSError as exc:
+                raise RuntimeError(
+                    "无法绑定网卡 {!r}: {}".format(NETWORK_INTERFACE, exc)
+                ) from exc
         # UDP 地址绑定
         self.udp.bind((self.bind_ip, self.bind_port))
         # redis 客户端
@@ -85,7 +89,7 @@ class DHTServer:
 
     def bootstrap(self):
         """
-        利用 tracker 服务器，伪装成 DHT 节点，加入 DHT 网络
+        通过公共 DHT router 获取初始节点，加入 DHT 网络。
         """
         for address in BOOTSTRAP_NODES:
             self.send_find_node(address)
@@ -121,6 +125,38 @@ class DHTServer:
         """
         msg = dict(t=tid, y="e", e=[202, "Server Error"])
         self.send_krpc(msg, address)
+
+    def send_response(self, tid, address, **values):
+        values.setdefault("id", self.nid)
+        self.send_krpc(dict(t=tid, y="r", r=values), address)
+
+    def _rotate_token_secret(self):
+        if time.monotonic() - self.token_secret_changed < TOKEN_ROTATE_SECONDS:
+            return
+        self.previous_token_secret = self.token_secret
+        self.token_secret = os.urandom(20)
+        self.token_secret_changed = time.monotonic()
+
+    @staticmethod
+    def _token_for(secret, ip):
+        return hashlib.sha1(secret + ip.encode("ascii")).digest()[:8]
+
+    def make_token(self, ip):
+        self._rotate_token_secret()
+        return self._token_for(self.token_secret, ip)
+
+    def validate_token(self, token, ip):
+        self._rotate_token_secret()
+        if not isinstance(token, bytes):
+            return False
+        valid_tokens = [self._token_for(self.token_secret, ip)]
+        if self.previous_token_secret is not None:
+            valid_tokens.append(self._token_for(self.previous_token_secret, ip))
+        return any(hmac.compare_digest(token, value) for value in valid_tokens)
+
+    def neighbor_id(self, target):
+        """Return a stable per-process node ID close to the requested hash."""
+        return target[:14] + self.nid[14:]
 
     def send_find_node(self, address, nid=None):
         """
@@ -166,18 +202,44 @@ class DHTServer:
                 # 一旦节点队列为空，则重新加入 DHT 网络
                 self.bootstrap()
 
-    def save_magnet(self, info_hash):
+    def save_magnet(self, info_hash, source="get_peers", announced_peer=None):
         """
         将磁力链接保存到数据库
 
         :param info_hash:  磁力链接的 info_hash
+        :param announced_peer: token 验证通过的 (ip, port)
         """
+        if len(info_hash) != PER_NID_LEN:
+            return
         # 使用 codecs 解码 info_hash
         hex_info_hash = codecs.getencoder("hex")(info_hash)[0].decode()
         magnet = MAGNET_PER.format(hex_info_hash)
-        self.rc.add_magnet(magnet)
+        self.rc.add_magnet(magnet, source=source)
+        if announced_peer is not None:
+            peer_ip, peer_port = announced_peer
+            self.rc.add_announced_peer(
+                hex_info_hash,
+                peer_ip,
+                peer_port,
+            )
         # self.logger.info("pid " + str(self.process_id) + " - " + magnet)
         self.logger.info("pid_{0} - {1}".format(self.process_id, magnet))
+
+    @staticmethod
+    def announced_peer_endpoint(arguments, address):
+        """Resolve BEP 5 ``port``/``implied_port`` into a validated endpoint."""
+        ip = address[0]
+        try:
+            socket.inet_pton(socket.AF_INET, ip)
+        except OSError as exc:
+            raise ValueError("invalid announced peer IP") from exc
+        implied_port = arguments.get(b"implied_port", 0)
+        port = address[1] if implied_port else arguments[b"port"]
+        if isinstance(port, bool) or not isinstance(port, int):
+            raise ValueError("invalid announced peer port")
+        if not 1 <= port <= 65535:
+            raise ValueError("invalid announced peer port")
+        return ip, port
 
     def on_message(self, msg, address):
         """
@@ -202,10 +264,14 @@ class DHTServer:
             # 类型包含了请求所附加的参数。
             # 而实际上我们只需要获取这两者中的 info hash，用于构造磁力链接进而获取种子。
             elif msg[b"y"] == b"q":
+                if msg[b"q"] == b"ping":
+                    self.send_response(msg[b"t"], address)
+                elif msg[b"q"] == b"find_node":
+                    self.send_response(msg[b"t"], address, nodes=b"")
                 # get_peers 与 torrent 文件的 info_hash 有关。这时 KPRC 协议中的
                 # "q" = "get_peers"。get_peers 请求包含 2 个参数。第一个参数是 id，
                 # 包含了请求节点的 ID。第二个参数是 info_hash，它代表 torrent 文件的 info_hash
-                if msg[b"q"] == b"get_peers":
+                elif msg[b"q"] == b"get_peers":
                     self.on_get_peers_request(msg, address)
                 # announce_peer 表明请求的节点正在某个端口下载 torrent
                 # 文件。announce_peer 包含 4 个参数。第一个参数是 id，包含了请求节点的 ID；
@@ -242,25 +308,51 @@ class DHTServer:
         tid = msg[b"t"]
         try:
             info_hash = msg[b"a"][b"info_hash"]
-            self.save_magnet(info_hash)
-        except KeyError:
+            if len(info_hash) != PER_NID_LEN:
+                raise ValueError("invalid info hash length")
+            self.save_magnet(info_hash, source="get_peers")
+            self.send_response(
+                tid,
+                address,
+                id=self.neighbor_id(info_hash),
+                nodes=b"",
+                token=self.make_token(address[0]),
+            )
+        except (KeyError, ValueError):
             # 没有对应的 info hash，发送错误回复
             self.send_error(tid, address)
 
     def on_announce_peer_request(self, msg, address):
         """
         处理 get_announce 请求，获取 info hash，address, port
-        本爬虫目的暂时只是爬取磁链，所以忽略 address, port 有需要的
-        开发者可自行完善这部分内容
+
+        token 验证通过后，同时保存公告者的 IP 和有效端口。
+        ``implied_port`` 为真时使用 UDP 来源端口，否则使用 ``port``。
 
         :param msg: 节点报文信息
         :param address: 节点地址
         """
         tid = msg[b"t"]
         try:
-            info_hash = msg[b"a"][b"info_hash"]
-            self.save_magnet(info_hash)
-        except KeyError:
+            arguments = msg[b"a"]
+            info_hash = arguments[b"info_hash"]
+            token = arguments[b"token"]
+            if len(info_hash) != PER_NID_LEN or not self.validate_token(
+                token, address[0]
+            ):
+                raise ValueError("invalid announce token or info hash")
+            announced_peer = self.announced_peer_endpoint(arguments, address)
+            self.save_magnet(
+                info_hash,
+                source="announce_peer",
+                announced_peer=announced_peer,
+            )
+            self.send_response(
+                tid,
+                address,
+                id=self.neighbor_id(info_hash),
+            )
+        except (KeyError, ValueError):
             # 没有对应的 info hash，发送错误回复
             self.send_error(tid, address)
 

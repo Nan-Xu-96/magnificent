@@ -93,7 +93,9 @@
 
 * [crawler.py](https://github.com/chenjiandongx/magnet-dht/blob/master/magnet_dht/crawler.py)
 
-从 DHT 网络中获取磁力链接。主要是利用一些大型的服务器 tracker，冒充 DHT 节点，使用 UDP 协议加入到 DHT 网络中搜索一波以及和其他节点搞好关系，让他们也分享我点资源。
+从 DHT 网络中获取磁力链接。程序通过公共 DHT router 获取初始节点，
+响应 `get_peers` 并签发与请求者 IP 绑定的短期 token。只有携带有效 token 的
+`announce_peer` 才进入热度统计，避免把普通查询 hash 当成活跃资源。
 
 ![大哥喝可乐](https://user-images.githubusercontent.com/19553554/42406024-5b84186a-81d2-11e8-9ab9-b69762ea4186.jpg)
 
@@ -155,6 +157,9 @@ $ cd magnet-dht
 $ pip install -r requirements.txt
 ```
 
+如果使用项目内已创建的虚拟环境，先执行 `source .venv/bin/activate`；也可把下文的
+`python` 直接替换为 `.venv/bin/python`。
+
 **运行项目**
 
 进程数量可以在 crawler.py 进行调整
@@ -173,8 +178,225 @@ optional arguments:
 
 **Note:** 在运行 `python manage.py -m` 的时候，要先开个终端窗口启动 aria2c 服务。
 ```bash
-$ aria2c --enable-rpc=true --bt-metadata-only=true --bt-save-metadata=true
+$ export ARIA2RPC_SECRET='请换成长随机字符串'
+$ env -u all_proxy -u ALL_PROXY -u http_proxy -u HTTP_PROXY \
+    -u https_proxy -u HTTPS_PROXY \
+    aria2c \
+      --enable-rpc=true \
+      --rpc-secret="$ARIA2RPC_SECRET" \
+      --interface=wlp12s0 \
+      --enable-dht=true \
+      --bt-metadata-only=true \
+      --bt-save-metadata=true \
+      --max-concurrent-downloads=8 \
+      --listen-port=6881 \
+      --dht-listen-port=6881 \
+      --dir="$PWD/torrents"
 ```
+
+`wlp12s0` 是本机已测试可通 DHT 的 Wi-Fi 网卡，换机器后请用 `ip -br address`
+确认实际网卡名。本机有线网卡 `enp13s0f1` 的默认路由无法收到 DHT UDP
+回包，因此不要省略 `--interface` 。DHT 不走 HTTP/SOCKS 代理，所以上面显式清除了
+代理环境变量。
+
+然后在第二个终端运行一批候选检查：
+
+```bash
+$ export ARIA2RPC_SECRET='与-aria2c-一致的字符串'
+$ export MAGNET_DHT_INTERFACE=wlp12s0
+$ python manage.py -m
+```
+
+### announce 热度与候选选择
+
+`python manage.py -m` 不查询公共 Tracker，也不从 `magnets` 集合随机取 hash，而是：
+
+1. 只统计本机 crawler 真实收到且 token 验证通过的 `announce_peer`。
+   同时按 BEP 5 保存公告者 IP 和有效端口：`implied_port=1` 时使用
+   UDP 来源端口，否则使用公告中的 `port`。peer 最后公告时间作为
+   Redis sorted-set 分数，默认 30 分钟过期，每个 info hash 最多保留 64 个；
+2. 每个合法 announce 到达时立刻增加当前小时桶中的分数；“小时桶”只是 Redis 的
+   滑动窗口存储方式，不需要等当前小时结束。默认统计最近 6 小时，热度每 2 小时
+   衰减一半；
+3. 常驻 worker 默认每 5 秒查看当前桶和历史桶，领取热度最高的 8 个候选，直接交给
+   aria2 通过 DHT 取元数据；
+4. metadata 成功或内容非法的 hash 永久过滤；网络失败的 hash 进入指数退避冷却，
+   冷却结束后可由新的 announce 再次触发，而不是永久丢弃；
+5. 默认 90 秒取不到元数据就停止；
+6. 下载到 `.torrent` 后重算 `info` 字典 SHA-1，必须和 magnet hash 一致，
+   同时拒绝绝对路径、`..` 穿越和 NUL 路径；
+7. 对新取得的视频 metadata，立即接管 aria2 自动生成且处于暂停状态的 payload
+   子任务，只取有限 piece 并抽一帧。这样复用刚刚活跃的 torrent 时机，不再等以后
+   按 hash 扫描可能已经失活的旧种子。
+
+可用以下变量调整策略：
+
+```bash
+export MAGNET_DHT_STOP_TIMEOUT=90          # 单个元数据任务最长时间
+export MAGNET_DHT_MAX_CONCURRENT=8          # 每批最多处理数
+export MAGNET_DHT_FAILURE_COOLDOWN=900      # 首次网络失败后冷却 15 分钟，再指数退避
+export MAGNET_DHT_ANNOUNCE_WINDOW_HOURS=6   # announce 统计窗口
+export MAGNET_DHT_ANNOUNCE_HALF_LIFE_HOURS=2
+export MAGNET_DHT_PEER_TTL=1800             # 已验证 announce peer 保留 30 分钟
+export MAGNET_DHT_PEERS_PER_HASH=64         # 每个 info hash 最多保留的 peer
+export MAGNET_DHT_ONCE_ONLY=false           # 失败冷却后可由新 announce 触发重试
+export MAGNET_DHT_SAMPLE_ON_METADATA=true   # metadata 成功后立即抽帧
+export MAGNET_DHT_SAMPLE_WORKERS=2           # 同时运行的抽帧任务数
+export MAGNET_DHT_METADATA_PROGRESS_INTERVAL=10
+```
+
+推荐让 worker 常驻，这样 crawler 写入当前桶后无需人工反复执行 `-m`：
+
+```bash
+python manage.py -m --watch --watch-interval 5 \
+  --sample-mib 64 \
+  --sample-idle-timeout 120 \
+  --sample-workers 2
+```
+
+`--watch` 模式空闲时不会退出，并会输出“继续轮询，不需要等待整点”。同一套 Redis
+建议只运行一个 `-m --watch` 实例；crawler 可以继续按原配置多进程运行。抽帧任务在
+后台线程执行，不阻塞下一批 metadata；待处理抽帧数达到 worker 数的两倍时会触发
+背压，暂缓领取新候选，避免队列无限增长。
+
+程序只负责技术校验，不对内容做自动分类。`python manage.py -p` 会打印已验证
+种子的文件名列表，供后续人工 review。
+
+导出适合 Excel/LibreOffice 的 UTF-8 CSV（每个唯一 info hash 一行）：
+
+```bash
+$ python manage.py --csv
+$ python manage.py --csv /path/to/result.csv
+```
+
+## 自托管影视目录（评分与影评）
+
+项目现在包含一个不依赖前端框架的轻量 Web MVP，将已爬取并通过校验的 `.torrent` 元数据整理成类似 NeoDB 的目录：可以搜索条目、查看文件清单和统计信息、写影评、打 1–5 星评分，并通过 JSON API 给后续客户端使用。NeoDB 的核心启发是“共享目录 + 条目评分/评论”，本项目只复用这个产品思路，不复制其代码。
+
+先导入本地元数据，再启动站点：
+
+```bash
+export MAGNET_DHT_TORRENT_DIR="$PWD/torrents"
+python manage.py --import-catalog
+python manage.py --web --host 127.0.0.1 --port 8080
+```
+
+浏览 `http://127.0.0.1:8080/`，在“导入元数据”页面也可以重新扫描目录。SQLite 默认写入 `catalog.sqlite3`，可用 `MAGNET_DHT_CATALOG_DB` 改路径。
+
+可用接口：
+
+* `GET /api/media?q=关键词&sort=rating`：搜索/排序条目；
+* `GET /api/media/<info_hash>`：读取条目、评分聚合与影评；
+* `POST /api/media/<info_hash>/reviews`：以表单或 JSON 提交 `author`、`rating`、`body`、`spoiler`；
+* `POST /api/import`（表单字段 `directory`）：扫描本地 torrent 元数据；
+* `GET /healthz`：健康检查。
+
+这个目录站只保存描述性元数据、评分和影评，不提供 torrent 文件下载、磁力操作、在线播放或对等网络分发入口；如需接入合法的本地媒体播放器，建议在自己的部署边界内另行设计鉴权和合规策略。
+
+### 分类和本地视频封面
+
+条目会根据文件扩展名分为“视频、音频、图片、文档、压缩包、其他”。首页默认显示视频，顶部标签可以切换到其他分类，也可以通过 `GET /api/media?category=audio` 查询指定分类。
+
+封面只从你已经放在本机的媒体目录中抽帧，不会通过磁力链接解析或下载视频。先安装 `ffmpeg`/`ffprobe`，再配置媒体目录：
+
+```bash
+export MAGNET_DHT_MEDIA_ROOT=/path/to/already-downloaded/media
+export MAGNET_DHT_COVER_DIR="$PWD/catalog-covers"
+python manage.py --generate-covers
+```
+
+也可以打开网页的“生成封面”页执行。生成的随机帧会按 info hash 保存为 JPG；重新导入或重新生成时会跳过已有封面。
+
+### torrent 分段抽帧与健康验证
+
+如果视频尚未在本机，不需要把完整视频下载下来。默认的 `python manage.py -m`
+会在取得一份新 metadata 后立即处理它。项目从每个已校验的
+`.torrent` 中选择体积最大的一个视频，要求 aria2 优先取得一小段经过 piece hash
+校验的数据，并反复尝试用 ffmpeg 解码第一张可用画面。抽帧成功后会立刻停止任务，
+临时视频片段也会删除；本机只长期保留 JPG 和 JSONL 健康报告。
+
+先启动前文配置好的 aria2 RPC 服务并安装 `ffmpeg`。即使 aria2 服务全局使用了
+`--bt-metadata-only=true`，这个抽样命令也会只对自己的 RPC 任务覆盖为 `false`。
+建议先做不联网的清单检查：
+
+```bash
+export ARIA2RPC_SECRET='与-aria2c-一致的字符串'
+python manage.py --sample-video-torrents --sample-dry-run --sample-limit 10
+```
+
+推荐直接让新 metadata 与抽帧衔接运行：
+
+```bash
+python manage.py -m --watch --watch-interval 5 \
+  --sample-mib 64 \
+  --sample-idle-timeout 120 \
+  --sample-workers 2
+```
+
+如果某一批只想保存 metadata，可加 `--no-sample-on-metadata`。独立扫描已有种子仍然
+可用，但它按文件名顺序处理的可能是很早以前取得、当前已经没有 peer 的资源：
+
+```bash
+python manage.py --sample-video-torrents \
+  --sample-limit 10 \
+  --sample-mib 64 \
+  --sample-dir "$PWD/video-samples" \
+  --sample-report "$PWD/video-health.jsonl"
+```
+
+BT 协议不能从 peer 处直接请求一个已经解码的 JPEG；最小传输单位是 piece，容器还
+可能需要文件头、尾部索引和关键帧。因此 `--sample-mib 64` 表示每个 torrent 最多
+尝试约 64 MiB 的分段数据，而不是只传输一张图片的字节数。程序还会将预算限制为
+不超过视频体积的一半、把单任务速度限制为默认 2 MiB/s，并在每次 RPC 轮询后检查预算，
+避免完成整个视频。可用 `--sample-rate-mib`、`--sample-timeout` 和
+`--sample-idle-timeout` 调整边界；空速超时现在默认 120 秒。过小、无法安全分段的
+视频会直接跳过。
+
+报告中的 `healthy` 表示已经从 hash 校验通过的 piece 中成功解码一帧；
+`unavailable` 表示本次检查没有及时取得数据或 aria2 报错；`inconclusive` 表示取得了
+部分数据但预算内无法解码，不能据此断言种子已死。图片保存为
+`video-samples/<info_hash>.jpg`，每次检查结果追加到 `video-health.jsonl`。请只下载你有
+权获取的内容。
+
+控制台每 10 秒打印一次 `[metadata-progress]` 或 `[sample-progress]`，包含当前状态、
+已下载字节、连接数、做种数和速度。最终结果与 JSONL 的 `outcome` 会进一步区分：
+
+* `no_peers`：连接数、做种数和下载量从始至终都是 0；
+* `peers_no_data`：发现过 peer 或连接，但没有收到可校验数据；
+* `partial_timeout`：已经下载了一部分，但停止前不足以解码；
+* `sample_budget_exhausted`：达到分段预算仍没有可解码帧；
+* `frame_decoded`：成功生成 JPG，抽样验证通过。
+
+默认输出 `torrent_metadata.csv`，包含 info hash、magnet URI、资源名、总大小、
+文件数、扩展名集合、创建者和创建时间。完整内部文件路径聚合在
+`file_paths_json` 单元格的 JSON 数组中。重复 info hash 只保留一行；无效种子会以
+`invalid` 状态记录错误原因。
+
+`torrent_saved_time_utc` 从 `.torrent` 文件修改时间生成，因此旧数据也有值。
+新 announce 热度流程成功时会追加写入 `torrents/.acquisitions.jsonl`，CSV 的
+`acquisition_method=announce_heat`、`acquisition_time_utc` 和 `announce_heat` 会精确标识这些新资源。
+
+查看 Redis 中的分类状态：
+
+```bash
+$ redis-cli SCARD magnets:metadata_valid
+$ redis-cli SCARD magnets:invalid
+$ redis-cli SCARD magnets:processed
+$ redis-cli SCARD magnets:cold
+$ redis-cli ZCARD magnets:retry_after
+$ redis-cli HGET magnets:last_error 'magnet:?xt=urn:btih:...'
+$ redis-cli HGET magnets:announce_count 'magnet:?xt=urn:btih:...'
+$ redis-cli --scan --pattern 'magnets:announce_hour:*'
+$ redis-cli ZREVRANGE 'magnets:announce_peers:<40位infohash>' 0 -1 WITHSCORES
+```
+
+`python manage.py -p` 会再次验证 `torrents/*.torrent` 的 info hash，并打印文件列表。
+抓取新 hash 时仍用 `python manage.py -s`；如果默认路由不通 DHT，
+先设置 `MAGNET_DHT_INTERFACE=wlp12s0`。普通 `get_peers` 只保存为原始观测，不会进入
+元数据下载队列；只有通过 token 验证的 `announce_peer` 会进入热度队列。
+这些 announce 中的 peer 端点会保存到 `magnets:announce_peers:<infohash>`，
+为后续直连 peer 或完整 DHT `values` 响应提供数据。当前 aria2 RPC 还是
+使用自己的 DHT 查找，因此“保存 endpoint”本身不会立即改变 aria2 的连接率。
 
 ## 😃 深刻的感悟
 
